@@ -23,6 +23,12 @@ docker run -it --rm --privileged --shm-size=256m -p 5050:5050 --name=go-judge cr
 A REST service to run program in restricted environment (Listening on `localhost:5050` by default).
 
 - **POST /run execute program in the restricted environment**
+- **POST /session create a Linux stateful sandbox session**
+  - `PUT/GET /session/:id/file/*filepath` write or read workspace files
+  - `GET /session/:id/files` list workspace files
+  - `POST /session/:id/exec` execute a command with persistent `/w` state
+  - `GET /session/:id/archive` download a ZIP workspace archive
+  - `DELETE /session/:id` destroy the session
 - GET /file list all cached file id to original name map
   - POST /file prepare a file in the go judge (in memory), returns fileId (can be referenced in /run parameter)
   - GET /file/:fileId downloads file from go judge (in memory), returns file content
@@ -82,6 +88,12 @@ Sandbox:
 - The default file store is in memory(`/dev/shm/`), local cache can be specified with `-dir` flag.
 - `-output-limit` specifies size limit of POSIX rlimit of output (default 256MiB)
 - `-copy-out-limit` specifies the default file copy out max (default 64MiB)
+
+Stateful sessions are REST-only and Linux-only. A session defaults to a 30-minute
+idle TTL and a 1024 MiB workspace quota. Session commands always use a separate
+network namespace, and operations for one session are serialized. The session
+resource-limit fields follow the existing `/run` semantics; zero values are not
+treated as an unlimited-resource request.
 
 You can find [more available configuration here](https://docs.goj.ac/configuration).
 

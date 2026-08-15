@@ -29,6 +29,7 @@ import (
 	"github.com/criyle/go-judge/envexec"
 	"github.com/criyle/go-judge/filestore"
 	"github.com/criyle/go-judge/pb"
+	"github.com/criyle/go-judge/session"
 	"github.com/criyle/go-judge/worker"
 	ginzap "github.com/gin-contrib/zap"
 	"github.com/gin-gonic/gin"
@@ -67,6 +68,7 @@ func main() {
 	// Init environment pool
 	fs, fsCleanUp := newFileStore(conf)
 	b, builderParam := newEnvBuilder(conf)
+	sessions, sessionsCleanUp := newSessionManager(conf, b)
 	envPool := newEnvPool(b, conf.EnableMetrics)
 	prefork(envPool, conf.PreFork)
 	work := newWorker(conf, envPool, fs)
@@ -79,8 +81,9 @@ func main() {
 
 	servers := []initFunc{
 		cleanUpWorker(work),
+		cleanUpSessions(sessions, sessionsCleanUp),
 		cleanUpFs(fsCleanUp),
-		initHTTPServer(conf, work, fs, builderParam),
+		initHTTPServer(conf, work, fs, builderParam, sessions),
 		initMonitorHTTPServer(conf),
 		initGRPCServer(conf, work, fs),
 	}
@@ -190,10 +193,65 @@ func cleanUpFs(fsCleanUp func() error) initFunc {
 	}
 }
 
-func initHTTPServer(conf *config.Config, work worker.Worker, fs filestore.FileStore, builderParam map[string]any) initFunc {
+func cleanUpSessions(manager *session.Manager, cleanUp func() error) initFunc {
+	return func() (start func(), cleanUpFn stopFunc) {
+		if manager == nil && cleanUp == nil {
+			return nil, nil
+		}
+		return nil, func(ctx context.Context) error {
+			var first error
+			if manager != nil {
+				if err := manager.Close(); err != nil {
+					first = err
+				}
+			}
+			if cleanUp != nil {
+				if err := cleanUp(); first == nil {
+					first = err
+				}
+			}
+			return first
+		}
+	}
+}
+
+func newSessionManager(conf *config.Config, builder pool.EnvBuilder) (*session.Manager, func() error) {
+	wb, ok := builder.(env.WorkspaceBuilder)
+	if !ok {
+		return nil, nil
+	}
+	// Keep the session tree beside, rather than inside, the file store tree so
+	// the independent shutdown cleanups cannot remove a live workspace.
+	root := conf.Dir + "-sessions"
+	outputLimit := uint64(64 << 20)
+	if conf.CopyOutLimit != nil && conf.CopyOutLimit.Byte() > 0 {
+		outputLimit = uint64(conf.CopyOutLimit.Byte())
+	}
+	var extraMemoryLimit envexec.Size
+	if conf.ExtraMemoryLimit != nil {
+		extraMemoryLimit = *conf.ExtraMemoryLimit
+	}
+	m, err := session.NewManager(session.Config{
+		Root:             root,
+		Builder:          wb,
+		OutputLimit:      outputLimit,
+		ExtraMemoryLimit: extraMemoryLimit,
+		OpenFileLimit:    uint64(conf.OpenFileLimit),
+		Parallelism:      conf.Parallelism,
+	})
+	if err != nil {
+		logger.Error("create session manager failed", zap.Error(err))
+		return nil, nil
+	}
+	return m, func() error {
+		return os.RemoveAll(root)
+	}
+}
+
+func initHTTPServer(conf *config.Config, work worker.Worker, fs filestore.FileStore, builderParam map[string]any, sessions *session.Manager) initFunc {
 	return func() (start func(), cleanUp stopFunc) {
 		// Init http handle
-		r := initHTTPMux(conf, work, fs, builderParam)
+		r := initHTTPMux(conf, work, fs, builderParam, sessions)
 		srv := http.Server{
 			Addr:    conf.HTTPAddr,
 			Handler: r,
@@ -309,7 +367,7 @@ func prefork(envPool worker.EnvironmentPool, prefork int) {
 	}
 }
 
-func initHTTPMux(conf *config.Config, work worker.Worker, fs filestore.FileStore, builderParam map[string]any) http.Handler {
+func initHTTPMux(conf *config.Config, work worker.Worker, fs filestore.FileStore, builderParam map[string]any, sessions *session.Manager) http.Handler {
 	var r *gin.Engine
 	if conf.Release {
 		gin.SetMode(gin.ReleaseMode)
@@ -340,6 +398,10 @@ func initHTTPMux(conf *config.Config, work worker.Worker, fs filestore.FileStore
 	cmdHandle.Register(r)
 	fileHandle := restexecutor.NewFileHandle(fs)
 	fileHandle.Register(r)
+	if sessions != nil {
+		sessionHandle := restexecutor.NewSessionHandle(sessions)
+		sessionHandle.Register(r)
+	}
 
 	// WebSocket Handle
 	wsHandle := wsexecutor.New(work, conf.SrcPrefix, logger)

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"sync"
 
+	"github.com/criyle/go-judge/env"
 	"github.com/criyle/go-judge/env/pool"
 	"github.com/criyle/go-judge/envexec"
 	"github.com/criyle/go-judge/filestore"
@@ -216,6 +218,19 @@ type metricsEnvBuilder struct {
 
 func (b *metricsEnvBuilder) Build() (pool.Environment, error) {
 	e, err := b.EnvBuilder.Build()
+	if err != nil {
+		return nil, err
+	}
+	envCreated.Inc()
+	return e, nil
+}
+
+func (b *metricsEnvBuilder) BuildWorkspace(path string) (pool.Environment, error) {
+	wb, ok := b.EnvBuilder.(env.WorkspaceBuilder)
+	if !ok {
+		return nil, fmt.Errorf("workspace builder is not supported")
+	}
+	e, err := wb.BuildWorkspace(path)
 	if err != nil {
 		return nil, err
 	}
