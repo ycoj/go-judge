@@ -45,7 +45,7 @@ func TestSessionRESTFileFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	r := gin.New()
 	NewSessionHandle(m).Register(r)

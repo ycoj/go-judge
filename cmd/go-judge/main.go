@@ -201,7 +201,7 @@ func cleanUpSessions(manager *session.Manager, cleanUp func() error) initFunc {
 		return nil, func(ctx context.Context) error {
 			var first error
 			if manager != nil {
-				if err := manager.Close(); err != nil {
+				if err := manager.CloseContext(ctx); err != nil {
 					first = err
 				}
 			}
@@ -216,6 +216,9 @@ func cleanUpSessions(manager *session.Manager, cleanUp func() error) initFunc {
 }
 
 func newSessionManager(conf *config.Config, builder pool.EnvBuilder) (*session.Manager, func() error) {
+	if unwrappable, ok := builder.(interface{ Unwrap() pool.EnvBuilder }); ok {
+		builder = unwrappable.Unwrap()
+	}
 	wb, ok := builder.(env.WorkspaceBuilder)
 	if !ok {
 		return nil, nil
@@ -223,6 +226,14 @@ func newSessionManager(conf *config.Config, builder pool.EnvBuilder) (*session.M
 	// Keep the session tree beside, rather than inside, the file store tree so
 	// the independent shutdown cleanups cannot remove a live workspace.
 	root := conf.Dir + "-sessions"
+	if conf.Dir == "" {
+		var err error
+		root, err = os.MkdirTemp("", "go-judge-sessions-")
+		if err != nil {
+			logger.Error("create session root failed", zap.Error(err))
+			return nil, nil
+		}
+	}
 	outputLimit := uint64(64 << 20)
 	if conf.CopyOutLimit != nil && conf.CopyOutLimit.Byte() > 0 {
 		outputLimit = uint64(conf.CopyOutLimit.Byte())
@@ -241,6 +252,7 @@ func newSessionManager(conf *config.Config, builder pool.EnvBuilder) (*session.M
 	})
 	if err != nil {
 		logger.Error("create session manager failed", zap.Error(err))
+		_ = os.RemoveAll(root)
 		return nil, nil
 	}
 	return m, func() error {
@@ -399,7 +411,7 @@ func initHTTPMux(conf *config.Config, work worker.Worker, fs filestore.FileStore
 	fileHandle := restexecutor.NewFileHandle(fs)
 	fileHandle.Register(r)
 	if sessions != nil {
-		sessionHandle := restexecutor.NewSessionHandle(sessions)
+		sessionHandle := restexecutor.NewSessionHandle(sessions, logger)
 		sessionHandle.Register(r)
 	}
 

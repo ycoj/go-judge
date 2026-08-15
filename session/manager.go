@@ -34,6 +34,7 @@ var (
 	ErrFileNotFound   = errors.New("file not found")
 	ErrInvalidPath    = errors.New("invalid session path")
 	ErrDiskLimit      = errors.New("session disk limit exceeded")
+	ErrSessionLimit   = errors.New("session limit exceeded")
 	ErrAlreadyClosed  = errors.New("session is closed")
 	ErrUnsupported    = errors.New("session sandbox is not supported")
 	ErrInvalidRequest = errors.New("invalid session request")
@@ -54,6 +55,7 @@ type Config struct {
 	ExtraMemoryLimit  envexec.Size
 	OpenFileLimit     uint64
 	Parallelism       int
+	MaxSessions       int
 }
 
 type Manager struct {
@@ -65,6 +67,7 @@ type Manager struct {
 	outputLimit       uint64
 	extraMemoryLimit  envexec.Size
 	openFileLimit     uint64
+	maxSessions       int
 	sem               chan struct{}
 
 	mu        sync.RWMutex
@@ -84,9 +87,15 @@ type Session struct {
 
 	mu       sync.Mutex
 	refs     atomic.Int32
-	closed   bool
+	closed   atomic.Bool
 	lastUsed atomic.Int64
 	env      pool.Environment
+
+	cancelMu   sync.Mutex
+	execCancel context.CancelFunc
+	usageMu    sync.Mutex
+	usageBytes int64
+	usageKnown bool
 }
 
 type CreateRequest struct {
@@ -159,6 +168,7 @@ func NewManager(cfg Config) (*Manager, error) {
 		outputLimit:       cfg.OutputLimit,
 		extraMemoryLimit:  cfg.ExtraMemoryLimit,
 		openFileLimit:     cfg.OpenFileLimit,
+		maxSessions:       cfg.MaxSessions,
 		sem:               make(chan struct{}, cfg.Parallelism),
 		sessions:          make(map[string]*Session),
 		stop:              make(chan struct{}),
@@ -193,8 +203,14 @@ func (m *Manager) Create(req CreateRequest) (*Session, error) {
 		if err != nil {
 			return nil, err
 		}
+		m.mu.Lock()
+		if m.maxSessions > 0 && len(m.sessions) >= m.maxSessions {
+			m.mu.Unlock()
+			return nil, ErrSessionLimit
+		}
 		workspace := filepath.Join(m.root, id)
 		if err := os.Mkdir(workspace, 0o777); err != nil {
+			m.mu.Unlock()
 			if errors.Is(err, os.ErrExist) {
 				continue
 			}
@@ -203,7 +219,6 @@ func (m *Manager) Create(req CreateRequest) (*Session, error) {
 		now := time.Now()
 		s := &Session{id: id, createdAt: now, workspace: workspace, ttl: ttl, maxDisk: maxDisk, manager: m}
 		s.lastUsed.Store(now.UnixNano())
-		m.mu.Lock()
 		m.sessions[id] = s
 		m.mu.Unlock()
 		return s, nil
@@ -237,7 +252,7 @@ func (s *Session) begin() error {
 	s.refs.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed.Load() {
 		s.refs.Add(-1)
 		return ErrNotFound
 	}
@@ -248,6 +263,10 @@ func (s *Session) begin() error {
 func (s *Session) end() { s.refs.Add(-1) }
 
 func (m *Manager) Delete(id string) error {
+	return m.delete(context.Background(), id)
+}
+
+func (m *Manager) delete(ctx context.Context, id string) error {
 	m.mu.Lock()
 	s := m.sessions[id]
 	if s == nil {
@@ -257,13 +276,23 @@ func (m *Manager) Delete(id string) error {
 	delete(m.sessions, id)
 	m.mu.Unlock()
 
-	s.mu.Lock()
-	s.closed = true
-	if s.env != nil {
-		_ = s.env.Destroy()
-		s.env = nil
+	s.closed.Store(true)
+	s.cancelExecution()
+	for {
+		if s.mu.TryLock() {
+			if s.env != nil {
+				_ = s.env.Destroy()
+				s.env = nil
+			}
+			s.mu.Unlock()
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return os.RemoveAll(s.workspace)
+		case <-time.After(time.Millisecond):
+		}
 	}
-	s.mu.Unlock()
 	return os.RemoveAll(s.workspace)
 }
 
@@ -278,11 +307,36 @@ func (s *Session) withLock(fn func() error) error {
 	defer s.end()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed.Load() {
 		return ErrNotFound
 	}
 	s.lastUsed.Store(time.Now().UnixNano())
 	return fn()
+}
+
+func (s *Session) setExecCancel(cancel context.CancelFunc) {
+	s.cancelMu.Lock()
+	if s.closed.Load() {
+		s.cancelMu.Unlock()
+		cancel()
+		return
+	}
+	s.execCancel = cancel
+	s.cancelMu.Unlock()
+}
+
+func (s *Session) clearExecCancel() {
+	s.cancelMu.Lock()
+	s.execCancel = nil
+	s.cancelMu.Unlock()
+}
+
+func (s *Session) cancelExecution() {
+	s.cancelMu.Lock()
+	if s.execCancel != nil {
+		s.execCancel()
+	}
+	s.cancelMu.Unlock()
 }
 
 func (s *Session) WriteFile(name string, r io.Reader) (int64, error) {
@@ -299,7 +353,7 @@ func (s *Session) WriteFile(name string, r io.Reader) (int64, error) {
 		if fi, statErr := os.Stat(p); statErr == nil && fi.Mode().IsRegular() {
 			oldSize = fi.Size()
 		}
-		usage, err := s.usage()
+		usage, err := s.refreshUsage()
 		if err != nil {
 			return err
 		}
@@ -312,18 +366,18 @@ func (s *Session) WriteFile(name string, r io.Reader) (int64, error) {
 			return err
 		}
 		tmpName := tmp.Name()
-		defer os.Remove(tmpName)
+		defer func() { _ = os.Remove(tmpName) }()
 		written, copyErr := io.Copy(tmp, io.LimitReader(r, remaining+1))
 		if copyErr != nil {
-			tmp.Close()
+			_ = tmp.Close()
 			return copyErr
 		}
 		if written > remaining {
-			tmp.Close()
+			_ = tmp.Close()
 			return ErrDiskLimit
 		}
 		if err := tmp.Chmod(0o666); err != nil {
-			tmp.Close()
+			_ = tmp.Close()
 			return err
 		}
 		if err := tmp.Close(); err != nil {
@@ -332,6 +386,7 @@ func (s *Session) WriteFile(name string, r io.Reader) (int64, error) {
 		if err := os.Rename(tmpName, p); err != nil {
 			return err
 		}
+		s.adjustUsage(written - oldSize)
 		size = written
 		return nil
 	})
@@ -352,6 +407,23 @@ func (s *Session) ReadFile(name string) ([]byte, error) {
 		return err
 	})
 	return data, err
+}
+
+// OpenFile resolves and opens a session file without buffering its contents.
+func (s *Session) OpenFile(name string) (*os.File, error) {
+	var file *os.File
+	err := s.withLock(func() error {
+		p, err := s.resolve(name, false)
+		if err != nil {
+			return err
+		}
+		file, err = os.Open(p)
+		if errors.Is(err, os.ErrNotExist) {
+			return ErrFileNotFound
+		}
+		return err
+	})
+	return file, err
 }
 
 func (s *Session) ListFiles() ([]FileEntry, error) {
@@ -405,20 +477,20 @@ func (s *Session) Archive(patterns string) (string, error) {
 					err = openErr
 				} else {
 					_, err = io.Copy(entry, in)
-					in.Close()
+					_ = in.Close()
 				}
 			}
 			if err != nil {
-				zw.Close()
-				f.Close()
-				os.Remove(archivePath)
+				_ = zw.Close()
+				_ = f.Close()
+				_ = os.Remove(archivePath)
 				archivePath = ""
 				return err
 			}
 		}
 		if err := zw.Close(); err != nil {
-			f.Close()
-			os.Remove(archivePath)
+			_ = f.Close()
+			_ = os.Remove(archivePath)
 			archivePath = ""
 			return err
 		}
@@ -481,7 +553,17 @@ func (s *Session) Exec(ctx context.Context, req ExecRequest) (ExecResponse, erro
 	}
 	var response ExecResponse
 	err := s.withLock(func() error {
-		if usage, usageErr := s.usage(); usageErr != nil {
+		if s.closed.Load() {
+			return ErrNotFound
+		}
+		runCtx, cancel := context.WithCancel(ctx)
+		s.setExecCancel(cancel)
+		defer s.clearExecCancel()
+		defer cancel()
+		if s.closed.Load() {
+			return ErrNotFound
+		}
+		if usage, usageErr := s.refreshUsage(); usageErr != nil {
 			return usageErr
 		} else if usage > s.maxDisk {
 			return ErrDiskLimit
@@ -489,8 +571,8 @@ func (s *Session) Exec(ctx context.Context, req ExecRequest) (ExecResponse, erro
 		select {
 		case s.manager.sem <- struct{}{}:
 			defer func() { <-s.manager.sem }()
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-runCtx.Done():
+			return runCtx.Err()
 		}
 		if s.env == nil {
 			var err error
@@ -516,8 +598,14 @@ func (s *Session) Exec(ctx context.Context, req ExecRequest) (ExecResponse, erro
 			if limit == 0 {
 				limit = cpuLimit
 			}
-			ticker := time.NewTicker(s.manager.diskCheckInterval)
-			defer ticker.Stop()
+			timeTicker := time.NewTicker(s.manager.diskCheckInterval)
+			defer timeTicker.Stop()
+			diskPeriod := s.manager.diskCheckInterval * 4
+			if diskPeriod < 200*time.Millisecond {
+				diskPeriod = 200 * time.Millisecond
+			}
+			diskTicker := time.NewTicker(diskPeriod)
+			defer diskTicker.Stop()
 			start := time.Now()
 			for {
 				select {
@@ -525,12 +613,13 @@ func (s *Session) Exec(ctx context.Context, req ExecRequest) (ExecResponse, erro
 					return false
 				case <-process.Done():
 					return false
-				case <-ticker.C:
-					if usage, usageErr := s.usage(); usageErr == nil && usage > s.maxDisk {
+				case <-diskTicker.C:
+					if usage, usageErr := s.refreshUsage(); usageErr == nil && usage > s.maxDisk {
 						quotaHit.Store(true)
 						return true
 					}
-					if time.Since(start) > limit {
+				case <-timeTicker.C:
+					if limit > 0 && time.Since(start) > limit {
 						return true
 					}
 					u := process.Usage()
@@ -557,10 +646,10 @@ func (s *Session) Exec(ctx context.Context, req ExecRequest) (ExecResponse, erro
 		if err != nil {
 			return err
 		}
-		defer os.RemoveAll(storeDir)
+		defer func() { _ = os.RemoveAll(storeDir) }()
 		result, runErr := (&envexec.Single{Cmd: cmd, NewStoreFile: func() (*os.File, error) {
 			return os.CreateTemp(storeDir, "output-*")
-		}}).Run(ctx)
+		}}).Run(runCtx)
 		_ = os.Remove(filepath.Join(s.workspace, stdoutName))
 		_ = os.Remove(filepath.Join(s.workspace, stderrName))
 		if runErr != nil {
@@ -575,8 +664,8 @@ func (s *Session) Exec(ctx context.Context, req ExecRequest) (ExecResponse, erro
 		}
 		for name, file := range result.Files {
 			data, readErr := os.ReadFile(file.Name())
-			file.Close()
-			os.Remove(file.Name())
+			_ = file.Close()
+			_ = os.Remove(file.Name())
 			if readErr != nil {
 				return readErr
 			}
@@ -591,6 +680,10 @@ func (s *Session) Exec(ctx context.Context, req ExecRequest) (ExecResponse, erro
 			response.Error = result.Error
 		}
 		if quotaHit.Load() {
+			response.Status = "Internal Error"
+			response.Error = ErrDiskLimit.Error()
+		}
+		if usage, usageErr := s.refreshUsage(); usageErr == nil && usage > s.maxDisk {
 			response.Status = "Internal Error"
 			response.Error = ErrDiskLimit.Error()
 		}
@@ -632,12 +725,9 @@ func ensureWithin(root, target string, forWrite bool) error {
 	if forWrite {
 		check = filepath.Dir(target)
 	}
-	resolved, suffix, err := resolveExistingAncestor(check)
+	resolved, err := resolveExistingAncestor(check)
 	if err != nil {
 		return ErrInvalidPath
-	}
-	if suffix != "" {
-		resolved = filepath.Join(resolved, suffix)
 	}
 	rel, err := filepath.Rel(root, resolved)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
@@ -646,25 +736,25 @@ func ensureWithin(root, target string, forWrite bool) error {
 	return nil
 }
 
-func resolveExistingAncestor(path string) (resolved, suffix string, err error) {
+func resolveExistingAncestor(path string) (resolved string, err error) {
 	current := path
 	var missing []string
 	for {
 		if _, statErr := os.Lstat(current); statErr == nil {
 			resolved, err = filepath.EvalSymlinks(current)
 			if err != nil {
-				return "", "", err
+				return "", err
 			}
 			for i := len(missing) - 1; i >= 0; i-- {
 				resolved = filepath.Join(resolved, missing[i])
 			}
-			return resolved, "", nil
+			return resolved, nil
 		} else if !errors.Is(statErr, os.ErrNotExist) {
-			return "", "", statErr
+			return "", statErr
 		}
 		parent := filepath.Dir(current)
 		if parent == current {
-			return "", "", os.ErrNotExist
+			return "", os.ErrNotExist
 		}
 		missing = append(missing, filepath.Base(current))
 		current = parent
@@ -672,6 +762,21 @@ func resolveExistingAncestor(path string) (resolved, suffix string, err error) {
 }
 
 func (s *Session) usage() (int64, error) {
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	if s.usageKnown {
+		return s.usageBytes, nil
+	}
+	return s.scanUsageLocked()
+}
+
+func (s *Session) refreshUsage() (int64, error) {
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	return s.scanUsageLocked()
+}
+
+func (s *Session) scanUsageLocked() (int64, error) {
 	var total int64
 	err := filepath.WalkDir(s.workspace, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -692,7 +797,22 @@ func (s *Session) usage() (int64, error) {
 		}
 		return nil
 	})
+	if err == nil {
+		s.usageBytes = total
+		s.usageKnown = true
+	}
 	return total, err
+}
+
+func (s *Session) adjustUsage(delta int64) {
+	s.usageMu.Lock()
+	if s.usageKnown {
+		s.usageBytes += delta
+		if s.usageBytes < 0 {
+			s.usageBytes = 0
+		}
+	}
+	s.usageMu.Unlock()
 }
 
 func (m *Manager) gcLoop() {
@@ -733,10 +853,20 @@ func (m *Manager) collectExpired() {
 }
 
 func (m *Manager) Close() error {
+	return m.CloseContext(context.Background())
+}
+
+func (m *Manager) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var closeErr error
 	m.closeOnce.Do(func() {
 		close(m.stop)
-		<-m.done
+		select {
+		case <-m.done:
+		case <-ctx.Done():
+		}
 		m.mu.Lock()
 		ids := make([]string, 0, len(m.sessions))
 		for id := range m.sessions {
@@ -744,7 +874,7 @@ func (m *Manager) Close() error {
 		}
 		m.mu.Unlock()
 		for _, id := range ids {
-			if err := m.Delete(id); err != nil && !errors.Is(err, ErrNotFound) && closeErr == nil {
+			if err := m.delete(ctx, id); err != nil && !errors.Is(err, ErrNotFound) && closeErr == nil {
 				closeErr = err
 			}
 		}

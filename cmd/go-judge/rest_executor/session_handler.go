@@ -9,14 +9,20 @@ import (
 
 	"github.com/criyle/go-judge/session"
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 type sessionHandle struct {
 	manager *session.Manager
+	logger  *zap.Logger
 }
 
-func NewSessionHandle(manager *session.Manager) Register {
-	return &sessionHandle{manager: manager}
+func NewSessionHandle(manager *session.Manager, loggers ...*zap.Logger) Register {
+	logger := zap.NewNop()
+	if len(loggers) > 0 && loggers[0] != nil {
+		logger = loggers[0]
+	}
+	return &sessionHandle{manager: manager, logger: logger}
 }
 
 func (h *sessionHandle) Register(r *gin.Engine) {
@@ -71,12 +77,13 @@ func (h *sessionHandle) readFile(c *gin.Context) {
 		return
 	}
 	name := strings.TrimPrefix(c.Param("filepath"), "/")
-	data, err := s.ReadFile(name)
+	f, err := s.OpenFile(name)
 	if err != nil {
 		h.writeError(c, err)
 		return
 	}
-	c.Data(http.StatusOK, "application/octet-stream", data)
+	defer func() { _ = f.Close() }()
+	c.DataFromReader(http.StatusOK, -1, "application/octet-stream", f, nil)
 }
 
 func (h *sessionHandle) listFiles(c *gin.Context) {
@@ -150,12 +157,20 @@ func (h *sessionHandle) writeError(c *gin.Context, err error) {
 		status = http.StatusBadRequest
 	case errors.Is(err, session.ErrDiskLimit):
 		status = http.StatusRequestEntityTooLarge
+	case errors.Is(err, session.ErrSessionLimit):
+		status = http.StatusTooManyRequests
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		status = http.StatusRequestTimeout
 	}
 	message := err.Error()
 	if errors.Is(err, session.ErrFileNotFound) {
 		message = "File not found"
+	}
+	if status == http.StatusInternalServerError {
+		if h.logger != nil {
+			h.logger.Error("session request failed", zap.Error(err))
+		}
+		message = "Internal server error"
 	}
 	c.JSON(status, gin.H{"error": message})
 }

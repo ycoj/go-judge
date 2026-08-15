@@ -42,6 +42,8 @@ docker run -it --rm --privileged --shm-size=256m -p 5050:5050 --name=go-judge cr
 
 [接口数据类型定义](https://docs.goj.ac/cn/api#rest-api-接口定义)
 
+[`/session` 有状态会话 API 文档](docs/session-api.md)
+
 ### 示例
 
 请使用 postman 或其他 REST API 调试工具向 http://localhost:5050/run 发送请求
