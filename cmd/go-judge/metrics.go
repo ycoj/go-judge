@@ -214,6 +214,8 @@ type metricsEnvBuilder struct {
 	pool.EnvBuilder
 }
 
+func (b *metricsEnvBuilder) Unwrap() pool.EnvBuilder { return b.EnvBuilder }
+
 func (b *metricsEnvBuilder) Build() (pool.Environment, error) {
 	e, err := b.EnvBuilder.Build()
 	if err != nil {

@@ -23,6 +23,12 @@ docker run -it --rm --privileged --shm-size=256m -p 5050:5050 --name=go-judge cr
 沙箱服务提供 REST API 接口来在受限制的环境中运行程序（默认监听于 `localhost:5050`）。
 
 - **POST /run 在受限制的环境中运行程序**
+- **POST /session 创建 Linux 有状态沙箱会话**
+  - `PUT/GET /session/:id/file/*filepath` 写入或读取工作区文件
+  - `GET /session/:id/files` 列出工作区文件
+  - `POST /session/:id/exec` 在持久化 `/w` 工作区中执行命令
+  - `GET /session/:id/archive` 下载 ZIP 工作区归档
+  - `DELETE /session/:id` 销毁会话
 - GET /file 得到所有在文件存储中的文件 ID 到原始命名映射
   - POST /file 上传一个文件到文件存储，返回一个文件 ID 用于提供给 /run 接口
   - GET /file/:fileId 下载文件 ID 指定的文件
@@ -35,6 +41,8 @@ docker run -it --rm --privileged --shm-size=256m -p 5050:5050 --name=go-judge cr
 ### REST API 接口定义
 
 [接口数据类型定义](https://docs.goj.ac/cn/api#rest-api-接口定义)
+
+[`/session` 有状态会话 API 文档](docs/session-api.md)
 
 ### 示例
 
@@ -84,6 +92,10 @@ docker run -it --rm --privileged --shm-size=256m -p 5050:5050 --name=go-judge cr
 - 默认文件存储在共享内存文件系统中（`/dev/shm/`），可以使用 `-dir` 指定另外的本地目录为文件存储
 - 默认最大输出限制为 `256MiB`，使用 `-output-limit` 指定 POSIX rlimit 的输出限制
 - 默认最大 `copyOut` 文件大小为 `64MiB` ，使用 `-copy-out-limit` 指定
+
+有状态会话仅支持 REST 和 Linux。默认空闲 TTL 为 30 分钟，工作区配额为
+1024 MiB。会话命令始终使用独立网络命名空间，同一会话内的文件操作和命令
+会串行执行。会话资源限制字段沿用现有 `/run` 语义，零值不表示无限资源。
 
 可以[在此查看更多配置文档](https://docs.goj.ac/cn/configuration)。
 

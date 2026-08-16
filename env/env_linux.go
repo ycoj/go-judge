@@ -86,16 +86,17 @@ func NewBuilder(c Config, logger *zap.Logger) (pool.EnvBuilder, map[string]any, 
 
 	if tryClone3Builder := tryClone3(c, b, cgb, cgroupType, cgroupPool, workDir, seccomp, logger); tryClone3Builder != nil {
 		conf["clone3"] = true
-		return tryClone3Builder, conf, nil
+		return workspaceBuilderFrom(tryClone3Builder, b, m, cgroupPool, workDir, seccomp, c.EnableCPURate), conf, nil
 	}
 
-	return linuxcontainer.NewEnvBuilder(linuxcontainer.Config{
+	normal := linuxcontainer.NewEnvBuilder(linuxcontainer.Config{
 		Builder:    b,
 		CgroupPool: cgroupPool,
 		WorkDir:    workDir,
 		CPURate:    c.EnableCPURate,
 		Seccomp:    seccomp,
-	}), conf, nil
+	})
+	return workspaceBuilderFrom(normal, b, m, cgroupPool, workDir, seccomp, c.EnableCPURate), conf, nil
 }
 
 func prepareMountAndPaths(c Config, logger *zap.Logger) (*Mounts, *mount.Builder, []container.SymbolicLink, []string, error) {
